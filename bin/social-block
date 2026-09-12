@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# social-block — block the sites that eat your time, during the hours you
+# choose, by null-routing them in /etc/hosts.
+#
+# One file on purpose: you are about to run it as root, so you can read all
+# of it first. https://github.com/anmol-goyal7/social-block
+
+VERSION=0.1.0
+
+# Everything the tool touches can be redirected. That is how the tests run
+# without root and without ever seeing the real /etc/hosts.
+HOSTS=${SOCIAL_BLOCK_HOSTS:-/etc/hosts}
+CONFIG=${SOCIAL_BLOCK_CONFIG:-/etc/social-block/config}
+STATE=${SOCIAL_BLOCK_STATE:-/var/lib/social-block}
+NOW_OVERRIDE=${SOCIAL_BLOCK_NOW:-}
+
+BEGIN='# BEGIN social-block'
+END='# END social-block'
+
+# Day names and sort order must not depend on the caller's locale.
+export LC_ALL=C
+
+# ---------------------------------------------------------------- helpers --
+
+die()  { echo "social-block: $*" >&2; exit 1; }
+warn() { echo "social-block: $*" >&2; }
+trim() { local s=$1; s=${s#"${s%%[![:space:]]*}"}; s=${s%"${s##*[![:space:]]}"}; printf '%s' "$s"; }
+
+usage() {
+  cat <<'USAGE'
+usage: social-block <command>
+
+  status          what is blocked right now, why, and when that changes
+  on              block now, until the next scheduled change
+  off             unblock now, until the next scheduled change
+  check [FILE]    validate a config file (default: the installed one)
+  doctor          find out why the block is not working
+  apply           reconcile /etc/hosts with the schedule once
+  daemon          what the systemd service runs; not for humans
+  version         print the version
+
+Config: /etc/social-block/config   (see: social-block check)
+USAGE
+}
+
+# ----------------------------------------------------------------- config --
+# parse_config FILE fills these. A window record is "START|END|MASK|LABEL":
+# minutes since midnight, a day bitmask (bit 0 = Monday … bit 6 = Sunday),
+# and the canonical text shown to the user. The file is read line by line
+# and never sourced — it is root-owned, and sourcing would turn a typo into
+# code running as root.
+WINDOWS=()
+SITES=()
+LOCK=false
+CONFIG_ERRORS=()
+
+DAY_NAMES=(mon tue wed thu fri sat sun)
+HOST_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+
+CFG_NAME=''
+CFG_LINE=0
+cfg_err() { CONFIG_ERRORS+=("$CFG_NAME:$CFG_LINE: $*"); }
+
+# "H:MM" -> minutes since midnight; fails on anything else.
+parse_time() {
+  [[ $1 =~ ^([0-9]{1,2}):([0-9]{2})$ ]] || return 1
+  local h=$((10#${BASH_REMATCH[1]})) m=$((10#${BASH_REMATCH[2]}))
+  (( h <= 23 && m <= 59 )) || return 1
+  echo $((h * 60 + m))
+}
+fmt_time() { printf '%02d:%02d' $(($1 / 60)) $(($1 % 60)); }
+
+day_index() {
+  local i
+  for i in 0 1 2 3 4 5 6; do
+    if [[ ${DAY_NAMES[i]} == "$1" ]]; then echo "$i"; return 0; fi
+  done
+  return 1
+}
+
+# "mon-fri,sun" -> bitmask; ranges may wrap (fri-mon). Fails on any bad token.
+parse_days() {
+  local spec=${1,,} mask=0 tok a b i toks
+  IFS=, read -ra toks <<< "$spec"
+  [[ ${#toks[@]} -gt 0 ]] || return 1
+  for tok in "${toks[@]}"; do
+    tok=$(trim "$tok")
+    case $tok in
+      daily)    mask=127 ;;
+      weekdays) mask=$(( mask | 31 )) ;;
+      weekends) mask=$(( mask | 96 )) ;;
+      ?*-?*)
+        a=$(day_index "${tok%%-*}") || return 1
+        b=$(day_index "${tok##*-}") || return 1
+        i=$a
+        while :; do
+          mask=$(( mask | (1 << i) ))
+          (( i == b )) && break
+          i=$(( (i + 1) % 7 ))
+        done ;;
+      *)
+        a=$(day_index "$tok") || return 1
+        mask=$(( mask | (1 << a) )) ;;
+    esac
+  done
+  (( mask > 0 )) || return 1
+  echo "$mask"
+}
+
+fmt_days() {
+  local mask=$1 i out=''
+  case $mask in
+    127) echo daily;    return 0 ;;
+    31)  echo weekdays; return 0 ;;
+    96)  echo weekends; return 0 ;;
+  esac
+  for i in 0 1 2 3 4 5 6; do
+    (( mask & (1 << i) )) && out+="${out:+,}${DAY_NAMES[i]}"
+  done
+  echo "$out"
+}
+
+parse_schedule_line() {
+  local line=$1 range days start end mask
+  range=${line%%[[:space:]]*}
+  days=$(trim "${line#"$range"}")
+  [[ -n $days ]] || days=daily
+  if [[ $range != *-* ]]; then cfg_err "expected \"H:MM-H:MM [days]\", got \"$line\""; return 0; fi
+  start=$(parse_time "${range%%-*}") || { cfg_err "bad time \"${range%%-*}\""; return 0; }
+  end=$(parse_time "${range#*-}")    || { cfg_err "bad time \"${range#*-}\""; return 0; }
+  if (( start == end )); then cfg_err "window \"$range\" starts and ends at the same time"; return 0; fi
+  mask=$(parse_days "$days") || { cfg_err "bad days \"$days\" (use mon-fri, sat,sun, daily, weekdays or weekends)"; return 0; }
+  WINDOWS+=("$start|$end|$mask|$(fmt_time "$start")-$(fmt_time "$end") $(fmt_days "$mask")")
+}
+
+parse_option_line() {
+  local line=$1 key val
+  if [[ $line != *=* ]]; then cfg_err "expected \"key = value\", got \"$line\""; return 0; fi
+  key=$(trim "${line%%=*}"); val=$(trim "${line#*=}"); val=${val,,}
+  case $key in
+    lock)
+      case $val in
+        true|false) LOCK=$val ;;
+        *) cfg_err "lock must be true or false, got \"$val\"" ;;
+      esac ;;
+    *) cfg_err "unknown option \"$key\" (the only option is lock)" ;;
+  esac
+}
+
+parse_site_line() {
+  local host=${1,,}
+  if [[ $host =~ $HOST_RE ]]; then SITES+=("$host"); else cfg_err "not a hostname: \"$1\""; fi
+}
+
+# Parses FILE into WINDOWS/SITES/LOCK. Reports every error, then returns 1.
+parse_config() {
+  local file=$1 section='' raw line
+  WINDOWS=() SITES=() LOCK=false CONFIG_ERRORS=()
+  CFG_NAME=${file##*/} CFG_LINE=0
+  [[ -r $file ]] || { CONFIG_ERRORS+=("$file: cannot read"); return 1; }
+  while IFS= read -r raw || [[ -n $raw ]]; do
+    CFG_LINE=$((CFG_LINE + 1))
+    line=$(trim "${raw%%#*}")
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^\[(.*)\]$ ]]; then
+      section=${BASH_REMATCH[1]}
+      case $section in
+        schedule|options|sites) ;;
+        *) cfg_err "unknown section [$section]"; section=bad ;;
+      esac
+      continue
+    fi
+    case $section in
+      schedule) parse_schedule_line "$line" ;;
+      options)  parse_option_line "$line" ;;
+      sites)    parse_site_line "$line" ;;
+      bad)      ;;
+      '')       cfg_err "\"$line\" is outside any section (expected [schedule], [options] or [sites] first)" ;;
+    esac
+  done < "$file"
+  [[ ${#CONFIG_ERRORS[@]} -eq 0 ]]
+}
+
+# ------------------------------------------------------------------- main --
+
+main() {
+  set -euo pipefail
+  local cmd=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $cmd in
+    version)          echo "social-block $VERSION" ;;
+    help|-h|--help)   usage ;;
+    '')               usage >&2; exit 2 ;;
+    *)                echo "social-block: unknown command \"$cmd\"" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+[[ ${BASH_SOURCE[0]} != "$0" ]] || main "$@"
