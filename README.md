@@ -136,9 +136,10 @@ What it puts on your system:
 | `/var/lib/social-block/` | a temporary `on`/`off` override, if any |
 | `/etc/hosts.social-block-orig` | a copy of `/etc/hosts` from before the first install, taken once |
 
-Open tabs and a browser's own DNS cache outlive a switch. If a site still loads
-right after 22:00, that is why (Chrome: `chrome://net-internals/#dns` → *Clear
-host cache*).
+A switch takes effect within a couple of seconds: systemd-resolved re-checks
+`/etc/hosts` at most every two seconds. Open tabs and a browser's own DNS cache
+outlive it, though — if a site still loads right after 22:00, that is why
+(Chrome: `chrome://net-internals/#dns` → *Clear host cache*).
 
 ## Uninstall
 

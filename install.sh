@@ -40,7 +40,8 @@ valid_schedule() {
   tmp=$(mktemp)
   printf '[schedule]\n%s\n' "$1" > "$tmp"
   "$BIN" check "$tmp" >/dev/null 2>&1 || rc=$?
-  if (( rc != 0 )); then "$BIN" check "$tmp" 2>&1 | sed 's/^/  /' || true; fi
+  # The tool names the file and line in its errors; neither means anything here.
+  if (( rc != 0 )); then "$BIN" check "$tmp" 2>&1 | sed "s|^${tmp##*/}:[0-9]*: |  |" || true; fi
   rm -f "$tmp"
   return "$rc"
 }
