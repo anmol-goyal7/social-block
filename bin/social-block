@@ -181,6 +181,129 @@ parse_config() {
   [[ ${#CONFIG_ERRORS[@]} -eq 0 ]]
 }
 
+# ------------------------------------------------------------------- time --
+# Everything is local wall-clock at minute resolution. SOCIAL_BLOCK_NOW
+# freezes "now" for tests and for asking "what would happen at 3am".
+
+now_epoch() {
+  if [[ -n $NOW_OVERRIDE ]]; then
+    date -d "$NOW_OVERRIDE" +%s 2>/dev/null || die "SOCIAL_BLOCK_NOW: cannot parse \"$NOW_OVERRIDE\""
+  else
+    date +%s
+  fi
+}
+fmt_epoch() { date -d "@$1" '+%a %H:%M'; }
+fmt_delta() {
+  local s=$1 d h m
+  d=$(( s / 86400 )); h=$(( s % 86400 / 3600 )); m=$(( s % 3600 / 60 ))
+  if (( d > 0 )); then echo "${d}d ${h}h ${m}m"
+  elif (( h > 0 )); then echo "${h}h ${m}m"
+  else echo "${m}m"; fi
+}
+
+# Is any window active at EPOCH? Sets ACTIVE_LABEL to the one that is.
+# A window that crosses midnight is judged by the day it started on.
+ACTIVE_LABEL=''
+schedule_active() {
+  local epoch=$1 dow m yday w start end mask label
+  read -r dow m <<< "$(date -d "@$epoch" '+%u %H%M')"
+  dow=$(( dow - 1 ))                       # %u is 1=Mon..7=Sun; we use 0..6
+  m=$(( 10#${m:0:2} * 60 + 10#${m:2:2} ))
+  yday=$(( (dow + 6) % 7 ))
+  ACTIVE_LABEL=''
+  for w in "${WINDOWS[@]}"; do
+    IFS='|' read -r start end mask label <<< "$w"
+    if (( start < end )); then
+      if (( mask & (1 << dow) )) && (( m >= start && m < end )); then ACTIVE_LABEL=$label; return 0; fi
+    else
+      if (( mask & (1 << dow) )) && (( m >= start )); then ACTIVE_LABEL=$label; return 0; fi
+      if (( mask & (1 << yday) )) && (( m < end )); then ACTIVE_LABEL=$label; return 0; fi
+    fi
+  done
+  return 1
+}
+
+# Prints the epoch of the next moment "schedule active" flips, or returns 1
+# if it never does. The aggregate state can only change at some window's
+# start or end, so those instants over the next 8 days are the only
+# candidates; date -d builds them from "YYYY-MM-DD HH:MM" so DST is its job.
+next_boundary() {
+  local now=$1 cur cand noon day next d w start end mask label t cands=()
+  if schedule_active "$now"; then cur=1; else cur=0; fi
+  # Walk the calendar from today's noon in 24h steps: noon never lands near
+  # a DST switch, and it avoids "+1 day", which date happily reads as a
+  # UTC+1 offset when a time precedes it.
+  noon=$(date -d "$(date -d "@$now" +%F) 12:00" +%s)
+  for d in 0 1 2 3 4 5 6 7; do
+    day=$(date -d "@$(( noon + d * 86400 ))" +%F)
+    next=$(date -d "@$(( noon + (d + 1) * 86400 ))" +%F)
+    for w in "${WINDOWS[@]}"; do
+      IFS='|' read -r start end mask label <<< "$w"
+      t=$(date -d "$day $(fmt_time "$start")" +%s)
+      (( t > now )) && cands+=("$t")
+      if (( start < end )); then t=$(date -d "$day $(fmt_time "$end")" +%s)
+      else t=$(date -d "$next $(fmt_time "$end")" +%s); fi
+      (( t > now )) && cands+=("$t")
+    done
+  done
+  [[ ${#cands[@]} -gt 0 ]] || return 1
+  while read -r cand; do
+    if schedule_active "$cand"; then t=1; else t=0; fi
+    if (( t != cur )); then echo "$cand"; return 0; fi
+  done < <(printf '%s\n' "${cands[@]}" | sort -n -u)
+  return 1
+}
+
+# ------------------------------------------------------------------ hosts --
+# We own exactly the lines between the sentinels and nothing else. Both an
+# IPv4 and an IPv6 line per host: a resolver that asks per address family
+# ("hosts: files dns") would otherwise answer AAAA from DNS and leak.
+
+render_region() {
+  local s
+  echo "$BEGIN"
+  for s in "${SITES[@]}"; do
+    echo "0.0.0.0 $s www.$s m.$s"
+    echo ":: $s www.$s m.$s"
+  done
+  echo "$END"
+}
+
+# The current file with every copy of our region removed — including a
+# BEGIN that never found its END, which swallows to end of file rather than
+# leave half a region behind.
+strip_region() {
+  awk -v b="$BEGIN" -v e="$END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip   { print }' "$HOSTS"
+}
+
+region_present() { grep -qxF "$BEGIN" "$HOSTS"; }
+
+flush_resolver() {
+  # systemd-resolved caches answers and may keep serving the pre-switch one.
+  [[ $HOSTS == /etc/hosts ]] || return 0
+  command -v resolvectl >/dev/null 2>&1 || return 0
+  timeout 5 resolvectl flush-caches >/dev/null 2>&1 || true
+}
+
+# write_hosts on|off: converge the file. Returns 0 if it changed anything,
+# 1 if the file already matched (then nothing is written or flushed).
+write_hosts() {
+  local state=$1 tmp
+  tmp=$(mktemp "$HOSTS.XXXXXX")       # same directory, so the mv is atomic
+  { strip_region; if [[ $state == on ]]; then render_region; fi; } > "$tmp"
+  if cmp -s "$tmp" "$HOSTS"; then rm -f "$tmp"; return 1; fi
+  # mktemp made it 0600; that would break name resolution for every
+  # non-root process on the machine. Copy the original's mode and owner.
+  chmod --reference="$HOSTS" "$tmp"
+  chown --reference="$HOSTS" "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$HOSTS"
+  flush_resolver
+  return 0
+}
+
 # ------------------------------------------------------------------- main --
 
 main() {
