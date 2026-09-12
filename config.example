@@ -1,0 +1,35 @@
+# social-block configuration.  Edit, save — it is live within a minute.
+# Check it with:  social-block check
+
+# Windows to block in, one per line: START-END [DAYS]. 24-hour local time.
+# A window whose end is earlier than its start crosses midnight and belongs
+# to the day it STARTS on: "22:00-06:00 mon-fri" still blocks Saturday 02:00.
+# DAYS: daily (default), weekdays, weekends, names (mon,wed,fri), ranges (mon-fri).
+[schedule]
+22:00-06:00 daily
+# 09:00-17:00 weekdays
+
+[options]
+# lock = true makes an active window refuse "social-block off" until it ends.
+lock = false
+
+# One hostname per line. www. and m. variants are added automatically.
+[sites]
+instagram.com
+linkedin.com
+x.com
+twitter.com
+reddit.com
+old.reddit.com
+new.reddit.com
+np.reddit.com
+redd.it
+i.redd.it
+v.redd.it
+instagr.am
+lnkd.in
+t.co
+# youtube.com
+# tiktok.com
+# facebook.com
+# snapchat.com

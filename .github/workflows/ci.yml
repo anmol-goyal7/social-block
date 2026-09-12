@@ -1,0 +1,10 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y bats shellcheck
+      - run: shellcheck -x bin/social-block install.sh uninstall.sh tests/helpers.bash
+      - run: bats tests
