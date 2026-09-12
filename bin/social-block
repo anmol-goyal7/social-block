@@ -304,6 +304,160 @@ write_hosts() {
   return 0
 }
 
+# --------------------------------------------------------------- override --
+# "on"/"off" by hand are temporary: the override carries the next boundary
+# as its expiry, so the schedule always takes over again by itself.
+
+OV_STATE=''
+OV_UNTIL=''
+
+# Loads the override if it is valid and unexpired; otherwise drops it.
+read_override() {
+  local now=$1 f=$STATE/override k v
+  OV_STATE='' OV_UNTIL=''
+  [[ -f $f ]] || return 1
+  while IFS== read -r k v; do
+    case $k in state) OV_STATE=$v ;; until) OV_UNTIL=$v ;; esac
+  done < "$f"
+  if [[ ($OV_STATE != on && $OV_STATE != off) || ! $OV_UNTIL =~ ^[0-9]+$ ]] || (( now >= OV_UNTIL )); then
+    rm -f "$f" 2>/dev/null || true
+    OV_STATE='' OV_UNTIL=''
+    return 1
+  fi
+  return 0
+}
+
+write_override() {
+  mkdir -p "$STATE"
+  printf 'state=%s\nuntil=%s\n' "$1" "$2" > "$STATE/override"
+}
+
+# -------------------------------------------------------------- reconcile --
+
+CONFIG_OK=0
+DESIRED=off
+REASON=''
+
+lock_word() { if [[ $LOCK == true ]]; then echo on; else echo off; fi; }
+
+# What /etc/hosts should say at NOW. An override beats the schedule; an
+# invalid config means "off" (fail open — a typo must never lock anyone out).
+compute_desired() {
+  local now=$1
+  if read_override "$now"; then
+    DESIRED=$OV_STATE REASON="override until $(fmt_epoch "$OV_UNTIL")"
+  elif (( CONFIG_OK )) && schedule_active "$now"; then
+    DESIRED=on REASON=$ACTIVE_LABEL
+  elif (( CONFIG_OK )); then
+    DESIRED=off REASON='no window active'
+  else
+    DESIRED=off REASON='config invalid'
+  fi
+}
+
+# Report config errors. The daemon calls this every minute, so in quiet
+# mode an error is printed once when it appears, not once per tick.
+report_config_errors() {
+  local mode=$1 err
+  err=$(printf '%s\n' "${CONFIG_ERRORS[@]}")
+  if [[ $mode == verbose || $err != "$(cat "$STATE/last-error" 2>/dev/null || true)" ]]; then
+    printf '%s\n' "${CONFIG_ERRORS[@]}" >&2
+    warn "config invalid — block is off until it is fixed ($CONFIG)"
+  fi
+  mkdir -p "$STATE"
+  printf '%s\n' "$err" > "$STATE/last-error"
+}
+
+# One pass: read config, decide, converge, say so only if something changed.
+reconcile() {
+  local mode=$1 now
+  now=$(now_epoch)
+  if parse_config "$CONFIG"; then
+    CONFIG_OK=1
+    rm -f "$STATE/last-error" 2>/dev/null || true
+  else
+    CONFIG_OK=0
+    report_config_errors "$mode"
+  fi
+  compute_desired "$now"
+  if write_hosts "$DESIRED"; then warn "$DESIRED ($REASON)"; fi
+  (( CONFIG_OK )) || return 4
+  return 0
+}
+
+# Root is about the files, not the user: whoever can write the hosts file
+# and the state directory may run the writing commands.
+need_root() {
+  local dir=${HOSTS%/*} parent=${STATE%/*}
+  if [[ ! -w $HOSTS || ! -w ${dir:-/} ]] \
+     || { [[ -e $STATE ]] && [[ ! -w $STATE ]]; } \
+     || { [[ ! -e $STATE ]] && [[ ! -w ${parent:-/} ]]; }; then
+    die "needs root — try: sudo social-block $1"
+  fi
+}
+
+cmd_apply() { need_root apply; reconcile verbose; }
+
+# --------------------------------------------------------------- commands --
+
+# Force a state until the next boundary (or 24 h if the schedule has none).
+set_override() {
+  local want=$1 now until=''
+  now=$(now_epoch)
+  if parse_config "$CONFIG"; then
+    if [[ $want == off && $LOCK == true ]] && schedule_active "$now"; then
+      until=$(next_boundary "$now" || true)
+      echo "social-block: locked — $ACTIVE_LABEL is active${until:+ until $(fmt_epoch "$until")} (lock = true in $CONFIG)" >&2
+      exit 3
+    fi
+    until=$(next_boundary "$now" || true)
+  else
+    printf '%s\n' "${CONFIG_ERRORS[@]}" >&2
+  fi
+  [[ -n $until ]] || until=$(( now + 86400 ))
+  write_override "$want" "$until"
+  reconcile quiet >/dev/null 2>&1 || true
+  echo "social-block: $want until $(fmt_epoch "$until")"
+}
+cmd_on()  { need_root on;  set_override on; }
+cmd_off() { need_root off; set_override off; }
+
+cmd_status() {
+  local now rc=0 w nb have
+  now=$(now_epoch)
+  if parse_config "$CONFIG"; then CONFIG_OK=1; else CONFIG_OK=0; rc=4; printf '%s\n' "${CONFIG_ERRORS[@]}" >&2; fi
+  compute_desired "$now"
+  echo "social-block: ${DESIRED^^} ($REASON)"
+  if (( CONFIG_OK )); then
+    echo "schedule: ${#WINDOWS[@]} window(s), ${#SITES[@]} site(s), lock $(lock_word)"
+    for w in "${WINDOWS[@]}"; do echo "  ${w##*|}"; done
+    if nb=$(next_boundary "$now"); then
+      echo "next change: $(fmt_epoch "$nb") (in $(fmt_delta $(( nb - now ))))"
+    else
+      echo "next change: never (the schedule is empty or covers every hour)"
+    fi
+  else
+    echo "config: INVALID — block is off until it is fixed ($CONFIG)"
+  fi
+  [[ -z $OV_STATE ]] || echo "override: $OV_STATE until $(fmt_epoch "$OV_UNTIL")"
+  if region_present; then have=on; else have=off; fi
+  [[ $have == "$DESIRED" ]] || echo "hosts: $have — out of sync; the service fixes this within a minute (or: sudo social-block apply)"
+  return "$rc"
+}
+
+cmd_check() {
+  local file=${1:-$CONFIG} w
+  if parse_config "$file"; then
+    echo "$file: ok — ${#WINDOWS[@]} window(s), ${#SITES[@]} site(s), lock $(lock_word)"
+    for w in "${WINDOWS[@]}"; do echo "  ${w##*|}"; done
+    (( ${#WINDOWS[@]} )) || echo "  (no windows — nothing will ever be blocked)"
+    (( ${#SITES[@]} ))   || echo "  (no sites — nothing will ever be blocked)"
+  else
+    printf '%s\n' "${CONFIG_ERRORS[@]}" >&2
+    return 4
+  fi
+}
+
 # ------------------------------------------------------------------- main --
 
 main() {
@@ -311,6 +465,11 @@ main() {
   local cmd=${1:-}
   [[ $# -gt 0 ]] && shift
   case $cmd in
+    status)           cmd_status ;;
+    on)               cmd_on ;;
+    off)              cmd_off ;;
+    check)            cmd_check "$@" ;;
+    apply)            cmd_apply ;;
     version)          echo "social-block $VERSION" ;;
     help|-h|--help)   usage ;;
     '')               usage >&2; exit 2 ;;
