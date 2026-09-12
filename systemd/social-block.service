@@ -1,0 +1,21 @@
+[Unit]
+Description=social-block — keep /etc/hosts in step with the blocking schedule
+Documentation=https://github.com/anmol-goyal7/social-block
+ConditionPathExists=/etc/social-block/config
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/social-block daemon
+Restart=always
+RestartSec=5
+# It edits /etc/hosts and its own state directory; nothing else is writable.
+ProtectSystem=strict
+ReadWritePaths=/etc /var/lib/social-block
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

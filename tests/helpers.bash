@@ -12,4 +12,5 @@ setup_env() {
 }
 teardown_env() { rm -rf "$TMP"; }
 write_config() { cat > "$SOCIAL_BLOCK_CONFIG"; }
-at() { export SOCIAL_BLOCK_NOW=$1; NOW_OVERRIDE=$1; }  # shellcheck disable=SC2034
+# shellcheck disable=SC2034
+at() { export SOCIAL_BLOCK_NOW=$1; NOW_OVERRIDE=$1; }

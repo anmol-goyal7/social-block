@@ -316,7 +316,7 @@ read_override() {
   local now=$1 f=$STATE/override k v
   OV_STATE='' OV_UNTIL=''
   [[ -f $f ]] || return 1
-  while IFS== read -r k v; do
+  while IFS='=' read -r k v; do
     case $k in state) OV_STATE=$v ;; until) OV_UNTIL=$v ;; esac
   done < "$f"
   if [[ ($OV_STATE != on && $OV_STATE != off) || ! $OV_UNTIL =~ ^[0-9]+$ ]] || (( now >= OV_UNTIL )); then
@@ -458,6 +458,126 @@ cmd_check() {
   fi
 }
 
+# ----------------------------------------------------------------- daemon --
+# One long-lived process instead of a systemd timer: a timer firing every
+# minute writes three journal lines each time; this loop says nothing
+# unless the state changes. Recomputing from scratch each tick is what
+# makes boot, resume, config edits and hand-mangled files all heal within
+# a minute with no special cases.
+cmd_daemon() {
+  need_root daemon
+  while :; do
+    reconcile quiet || true
+    sleep $(( 60 - 10#$(date +%S) ))
+  done
+}
+
+# ----------------------------------------------------------------- doctor --
+# The block silently does nothing when the browser resolves names over
+# DNS-over-HTTPS, because that never consults /etc/hosts. This is the check
+# people actually need.
+
+# Chrome writes dns_over_https.mode to "Local State" only once it has been
+# changed; no key means the default, "automatic".
+chrome_doh_mode() {
+  local m
+  [[ -r $1 ]] || { echo unknown; return 0; }
+  # Flatten first: Chrome writes the file compact, but a pretty-printed one
+  # spreads the object over several lines and grep works a line at a time.
+  m=$(tr -d '\n ' < "$1" 2>/dev/null | grep -o '"dns_over_https":{[^}]*}' | grep -o '"mode":"[a-z]*"' | head -1 | cut -d'"' -f4)
+  echo "${m:-automatic}"
+}
+firefox_trr_mode() {
+  local m
+  m=$(grep -o 'user_pref("network.trr.mode", *[0-9]*)' "$1" 2>/dev/null | head -1 | grep -o '[0-9]*)$' | tr -d ')')
+  echo "${m:-unset}"
+}
+
+DOCTOR_BAD=0
+ok()  { echo "✓ $*"; }
+meh() { echo "⚠ $*"; }
+bad() { echo "✗ $*"; DOCTOR_BAD=1; }
+
+cmd_doctor() {
+  local now home d f mode have want w
+  now=$(now_epoch)
+  # Under sudo, look at the invoking user's browser profiles, not root's.
+  if [[ -n ${SUDO_USER:-} ]]; then home=$(getent passwd "$SUDO_USER" | cut -d: -f6); fi
+  home=${home:-$HOME}
+
+  if [[ $HOSTS == /etc/hosts ]]; then
+    if systemctl is-active --quiet social-block.service 2>/dev/null; then
+      ok "service: social-block.service is running"
+    else
+      bad "service: social-block.service is not running"
+      echo "    sudo systemctl enable --now social-block.service"
+    fi
+  fi
+
+  if parse_config "$CONFIG"; then
+    CONFIG_OK=1
+    ok "config: ${#WINDOWS[@]} window(s), ${#SITES[@]} site(s), lock $(lock_word)"
+    for w in "${WINDOWS[@]}"; do echo "    ${w##*|}"; done
+  else
+    CONFIG_OK=0
+    bad "config: invalid — the block is OFF until it is fixed"
+    printf '    %s\n' "${CONFIG_ERRORS[@]}"
+  fi
+
+  compute_desired "$now"; want=$DESIRED
+  if region_present; then have=on; else have=off; fi
+  if [[ $have == "$want" ]]; then
+    ok "hosts: matches (${want^^})"
+  elif [[ $want == on ]]; then
+    bad "hosts: region missing but the schedule says ON"; echo "    sudo social-block apply"
+  else
+    bad "hosts: region present but the schedule says OFF"; echo "    sudo social-block apply"
+  fi
+
+  if [[ -r /etc/nsswitch.conf ]]; then
+    if grep -Eq '^hosts:.*\b(files|resolve)\b' /etc/nsswitch.conf; then
+      ok "nsswitch: name lookups consult /etc/hosts"
+    else
+      bad "nsswitch: the hosts: line in /etc/nsswitch.conf has neither files nor resolve — /etc/hosts is ignored"
+    fi
+  fi
+
+  for d in google-chrome chromium BraveSoftware/Brave-Browser microsoft-edge vivaldi; do
+    f="$home/.config/$d/Local State"
+    [[ -f $f ]] || continue
+    mode=$(chrome_doh_mode "$f")
+    case $mode in
+      off)       ok  "${d##*/}: secure DNS is off" ;;
+      secure)    bad "${d##*/}: secure DNS is ON — this browser never reads /etc/hosts, the block does nothing in it"
+                 echo "    Settings → Privacy and security → Security → Use secure DNS → off" ;;
+      automatic) meh "${d##*/}: secure DNS is \"automatic\" — it switches to DNS-over-HTTPS whenever the system resolver is a known provider (1.1.1.1, 8.8.8.8, …)"
+                 echo "    to be certain: Settings → Privacy and security → Security → Use secure DNS → off" ;;
+      *)         meh "${d##*/}: could not read the secure DNS setting" ;;
+    esac
+  done
+  for f in /etc/opt/chrome/policies/managed/*.json /etc/chromium/policies/managed/*.json; do
+    [[ -f $f ]] || continue
+    if grep -q '"DnsOverHttpsMode" *: *"secure"' "$f"; then bad "$f forces DnsOverHttpsMode=secure"; fi
+  done
+  for f in "$home"/.mozilla/firefox/*/prefs.js; do
+    [[ -f $f ]] || continue
+    mode=$(firefox_trr_mode "$f")
+    case $mode in
+      5)   ok  "firefox: DNS-over-HTTPS is off (network.trr.mode = 5)" ;;
+      2|3) bad "firefox: DNS-over-HTTPS is ON (network.trr.mode = $mode) — Firefox never reads /etc/hosts, the block does nothing in it"
+           echo "    about:config → network.trr.mode → 5" ;;
+      *)   meh "firefox: DNS-over-HTTPS not explicitly disabled (network.trr.mode = $mode)"
+           echo "    to be certain: about:config → network.trr.mode → 5" ;;
+    esac
+  done
+
+  if pgrep -x 'chrome|chromium|brave|firefox|firefox-bin' >/dev/null 2>&1; then
+    meh "a browser is running: its own DNS cache and open tabs outlive a switch (Chrome: chrome://net-internals/#dns → Clear host cache)"
+  fi
+
+  (( DOCTOR_BAD == 0 ))
+}
+
 # ------------------------------------------------------------------- main --
 
 main() {
@@ -470,6 +590,8 @@ main() {
     off)              cmd_off ;;
     check)            cmd_check "$@" ;;
     apply)            cmd_apply ;;
+    daemon)           cmd_daemon ;;
+    doctor)           cmd_doctor ;;
     version)          echo "social-block $VERSION" ;;
     help|-h|--help)   usage ;;
     '')               usage >&2; exit 2 ;;
