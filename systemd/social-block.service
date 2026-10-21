@@ -8,7 +8,10 @@ Type=simple
 ExecStart=/usr/local/bin/social-block daemon
 Restart=always
 RestartSec=5
-# It edits /etc/hosts and its own state directory; nothing else is writable.
+# It only edits /etc/hosts and its own state directory, but /etc/hosts is
+# replaced atomically by renaming a temp file created next to it, which needs
+# write access to the directory, so all of /etc stays writable. Everything
+# else in the file system is read-only.
 ProtectSystem=strict
 ReadWritePaths=/etc /var/lib/social-block
 ProtectHome=yes

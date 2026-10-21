@@ -77,7 +77,8 @@ x.com
 - Start is inclusive, end is exclusive: at 22:00 you are blocked, at 06:00 you
   are not.
 - **Sites** are one hostname per line; `www.` and `m.` variants are added for
-  you. The shipped list covers Instagram, LinkedIn, X/Twitter and Reddit with
+  you. `/etc/hosts` has no wildcards, so any other subdomain (an app's
+  `api.` or `i.` host, say) is only blocked if you list it too. The shipped list covers Instagram, LinkedIn, X/Twitter and Reddit with
   their short links and side doors (`old.reddit.com` serves the whole site past
   a plain `reddit.com` block). YouTube, TikTok, Facebook and Snapchat are in the
   file, commented out.
